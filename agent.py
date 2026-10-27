@@ -1,63 +1,58 @@
-import os
+"""复用 Homework1 的 Function Calling 循环，供不同职责的 Agent 使用。"""
 import json
-from openai import OpenAI
-from tools import TOOLS_DEFINITION, AVAILABLE_TOOLS
+import os
+
+from tools import AVAILABLE_TOOLS, TOOLS_DEFINITION
+
 
 class CodeAgent:
-    def __init__(self, system_prompt="你是一个高级代码审查与解释助手。你可以使用工具读取本地文件，帮助用户审查代码质量、发现 Bug 并提供改进建议。"):
-        self.client = OpenAI(
-            api_key=os.getenv("OPENAI_API_KEY"),
-            base_url=os.getenv("OPENAI_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
-        )
-        self.model = os.getenv("MODEL_NAME", "qwen-max")
-        self.messages = [
-            {"role": "system", "content": system_prompt}
-        ]
+    def __init__(self, system_prompt, *, client=None, use_tools=False, max_steps=8):
+        if client is None:
+            from openai import OpenAI
 
-    def chat(self, user_input: str):
-        self.messages.append({"role": "user", "content": user_input})
-        
-        while True:
-            try:
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=self.messages,
-                    tools=TOOLS_DEFINITION,
-                    tool_choice="auto"
+            client = OpenAI(
+                api_key=os.getenv("OPENAI_API_KEY"),
+                base_url=os.getenv(
+                    "OPENAI_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"
+                ),
+                timeout=60.0,
+                max_retries=1,
+            )
+        self.client = client
+        self.model = os.getenv("MODEL_NAME", "qwen-max")
+        self.system_prompt = system_prompt
+        self.use_tools = use_tools
+        self.max_steps = max_steps
+        self.messages = []
+
+    def chat(self, user_input):
+        # 每次节点执行使用独立上下文；节点间的数据由 WorkflowState 显式传递。
+        self.messages = [
+            {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": user_input},
+        ]
+        for _ in range(self.max_steps):
+            kwargs = {"model": self.model, "messages": self.messages}
+            if self.use_tools:
+                kwargs.update(tools=TOOLS_DEFINITION, tool_choice="auto")
+            response = self.client.chat.completions.create(**kwargs)
+            message = response.choices[0].message
+            self.messages.append(message.model_dump(exclude_none=True))
+            if not message.tool_calls:
+                if not message.content or not message.content.strip():
+                    raise ValueError("Agent 返回了空内容")
+                return message.content
+            if not self.use_tools:
+                raise ValueError("该 Agent 未开放工具")
+            for call in message.tool_calls:
+                try:
+                    function = AVAILABLE_TOOLS[call.function.name]
+                    arguments = json.loads(call.function.arguments)
+                    result = function(**arguments)
+                except (KeyError, TypeError, ValueError) as exc:
+                    result = json.dumps({"status": "error", "message": str(exc)})
+                self.messages.append(
+                    {"tool_call_id": call.id, "role": "tool",
+                     "name": call.function.name, "content": result}
                 )
-                
-                response_message = response.choices[0].message
-                self.messages.append(response_message)
-                
-                # 如果模型决定调用工具
-                if response_message.tool_calls:
-                    for tool_call in response_message.tool_calls:
-                        function_name = tool_call.function.name
-                        function_args = json.loads(tool_call.function.arguments)
-                        
-                        print(f"\n[Agent 正在调用工具: {function_name}({function_args})]")
-                        
-                        function_to_call = AVAILABLE_TOOLS.get(function_name)
-                        if function_to_call:
-                            function_response = function_to_call(**function_args)
-                            
-                            self.messages.append({
-                                "tool_call_id": tool_call.id,
-                                "role": "tool",
-                                "name": function_name,
-                                "content": function_response,
-                            })
-                        else:
-                            self.messages.append({
-                                "tool_call_id": tool_call.id,
-                                "role": "tool",
-                                "name": function_name,
-                                "content": json.dumps({"error": "Tool not found"}),
-                            })
-                    # 将工具调用的结果再次发送给模型（进行下一轮推理）
-                    continue 
-                else:
-                    # 没有工具调用，输出最终回复
-                    return response_message.content
-            except Exception as e:
-                return f"Agent 运行出错: {str(e)}"
+        raise RuntimeError(f"Agent 超过最大调用轮数 {self.max_steps}")

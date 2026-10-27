@@ -1,11 +1,9 @@
-*.zip
-*.rar
-*.7z
-*.tar
-*.gz
-.DS_Store
 .env
 .venv/
 venv/
 __pycache__/
 *.pyc
+.DS_Store
+*.zip
+outputs/
+examples/*_run/
